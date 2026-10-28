@@ -18,7 +18,7 @@ test('only explicit document title conflicts count as duplicates', () => {
   assert.equal(isDuplicateTitle(500, { message: 'Document title already exists.' }), false);
 });
 
-test('duplicate titles are recorded and deleted without creation notifications; changed PDFs stay', async () => {
+test('duplicate titles are archived without creation notifications; changed PDFs stay', async () => {
   const folder = await fs.mkdtemp(path.join(os.tmpdir(), 'pdf-duplicate-'));
   const db = new DatabaseSync(':memory:');
   const originalFetch = global.fetch;
@@ -40,7 +40,10 @@ test('duplicate titles are recorded and deleted without creation notifications; 
       assert.equal(row.status, 'duplicate');
       assert.equal(row.http_status, code);
       assert.equal(row.uploaded_at, null);
-      assert.ok(row.deleted_at);
+      assert.ok(row.archived_at);
+      assert.equal(row.deleted_at, null);
+      assert.equal(path.basename(path.dirname(row.archive_path)), 'already-exists');
+      assert.equal(await fs.readFile(row.archive_path, 'utf8'), 'original PDF');
     }
     const changed = path.join(folder, 'changed.pdf');
     await fs.writeFile(changed, 'original PDF');
@@ -58,7 +61,7 @@ test('duplicate titles are recorded and deleted without creation notifications; 
   }
 });
 
-test('failed uploads wait, survive uploader restart, retry and delete only after success', async () => {
+test('failed uploads wait, survive uploader restart, and archive after confirmation', async () => {
   const folder = await fs.mkdtemp(path.join(os.tmpdir(), 'pdf-retry-'));
   const file = path.join(folder, 'test.pdf');
   const db = new DatabaseSync(':memory:');
@@ -74,7 +77,7 @@ test('failed uploads wait, survive uploader restart, retry and delete only after
     const notify = (title) => {
       notifications++;
       assert.equal(title, metadata.document_title);
-      // Notification errors must not stop deletion or cause another upload.
+      // Notification errors must not stop archiving or cause another upload.
       throw new Error('Simulated notification failure');
     };
     global.fetch = async (_url, options) => {
@@ -106,8 +109,13 @@ test('failed uploads wait, survive uploader restart, retry and delete only after
     assert.equal(calls, 2);
     assert.equal(notifications, 1);
     assert.equal(db.prepare('SELECT status FROM pdf_uploads').get().status, 'uploaded');
+    const created = db.prepare('SELECT archive_path, archived_at, deleted_at FROM pdf_uploads').get();
+    assert.equal(path.basename(path.dirname(created.archive_path)), 'created');
+    assert.equal(await fs.readFile(created.archive_path, 'utf8'), '%PDF-1.4 test');
+    assert.ok(created.archived_at);
+    assert.equal(created.deleted_at, null);
     await assert.rejects(fs.access(file), { code: 'ENOENT' });
-    // A returned PDF is deleted only after the API confirms its title exists.
+    // A returned PDF is archived only after the API confirms its title exists.
     await fs.writeFile(file, '%PDF-1.4 test');
     await upload(file, signature(await fs.stat(file)));
     assert.equal(calls, 3);
@@ -144,6 +152,41 @@ test('failed uploads wait, survive uploader restart, retry and delete only after
     assert.equal(calls, 6);
     assert.equal(db.prepare("SELECT COUNT(*) AS count FROM pdf_uploads WHERE status = 'parse_failed'").get().count, 1);
     await fs.access(file);
+  } finally {
+    global.fetch = originalFetch;
+    db.close();
+    await fs.rm(folder, { recursive: true, force: true });
+  }
+});
+
+test('archive failure resumes after restart without another API call', async () => {
+  const { manilaDate } = require('./archive');
+  const folder = await fs.mkdtemp(path.join(os.tmpdir(), 'pdf-move-retry-'));
+  const file = path.join(folder, 'test.pdf');
+  const db = new DatabaseSync(':memory:');
+  const originalFetch = global.fetch;
+  try {
+    await fs.writeFile(file, 'original PDF');
+    const expected = signature(await fs.stat(file));
+    // A file occupying the archive date path prevents creating a directory.
+    const obstruction = path.join(folder, manilaDate());
+    await fs.writeFile(obstruction, 'keep me');
+    const config = { url: 'http://localhost/test', token: 'test', user_id: 8, template_id: 5, desktopNotifications: false };
+    const metadata = { po_no: '31164', vendor: 'Vendor', document_date: '2026-10-22',
+      ship_to: 'Tagum', document_title: '31164-Vendor', filename: '31164-Vendor.pdf' };
+    let calls = 0;
+    global.fetch = async () => { calls++; return new Response(JSON.stringify({ data: { id: 35 } }), { status: 201 }); };
+    const first = createUploader(db, config, async () => metadata);
+    await assert.rejects(first(file, expected), /Archive directory cannot be a link/);
+    await fs.access(file);
+    await fs.unlink(obstruction);
+    const restarted = createUploader(db, config, async () => metadata);
+    await restarted(file, expected);
+    assert.equal(calls, 1);
+    const row = db.prepare('SELECT * FROM pdf_uploads').get();
+    assert.equal(await fs.readFile(row.archive_path, 'utf8'), 'original PDF');
+    assert.ok(row.archived_at);
+    await assert.rejects(fs.access(file), { code: 'ENOENT' });
   } finally {
     global.fetch = originalFetch;
     db.close();

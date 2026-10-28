@@ -5,6 +5,7 @@ const path = require('node:path');
 const { createHash } = require('node:crypto');
 const { extractPdfMetadata } = require('./pdf-metadata');
 const { notifyRequestCreated } = require('./notifications');
+const { archivePdf } = require('./archive');
 
 function signature(stat) {
   return `${stat.size}:${stat.mtimeMs}:${stat.ctimeMs}`;
@@ -49,6 +50,12 @@ function createUploader(database, config, extractMetadata = extractPdfMetadata, 
     database.exec('ALTER TABLE pdf_uploads ADD COLUMN po_metadata TEXT');
   }
   const saveMetadata = database.prepare('UPDATE pdf_uploads SET po_metadata = ?, document_title = ? WHERE id = ?');
+  for (const column of ['archive_path', 'archived_at']) {
+    if (!database.prepare('PRAGMA table_info(pdf_uploads)').all().some((item) => item.name === column)) {
+      database.exec(`ALTER TABLE pdf_uploads ADD COLUMN ${column} TEXT`);
+    }
+  }
+  const rememberArchive = database.prepare('UPDATE pdf_uploads SET archive_path = ? WHERE id = ?');
   const retryDelayMs = config.retryDelayMs || 30000;
   const scheduleRetry = database.prepare('UPDATE pdf_uploads SET next_retry_at = ? WHERE id = ?');
   const claimRetry = database.prepare(`UPDATE pdf_uploads SET status = 'uploading',
@@ -60,10 +67,10 @@ function createUploader(database, config, extractMetadata = extractPdfMetadata, 
     VALUES (?, ?, ?, ?, 'uploading', ?)`);
   const result = database.prepare(`UPDATE pdf_uploads SET status = ?, http_status = ?,
     response_body = ?, error = ?, uploaded_at = ? WHERE id = ?`);
-  const cleanup = database.prepare('UPDATE pdf_uploads SET deleted_at = ?, error = NULL WHERE id = ?');
+  const cleanup = database.prepare('UPDATE pdf_uploads SET archived_at = ?, error = NULL WHERE id = ?');
   const cleanupError = database.prepare('UPDATE pdf_uploads SET error = ? WHERE id = ?');
   const resetReturned = database.prepare(`UPDATE pdf_uploads SET status = 'failed',
-    deleted_at = NULL, uploaded_at = NULL, next_retry_at = NULL, error = NULL,
+    deleted_at = NULL, uploaded_at = NULL, archive_path = NULL, archived_at = NULL, next_retry_at = NULL, error = NULL,
     http_status = NULL, response_body = NULL
     WHERE id = ? AND status NOT IN ('failed', 'uncertain')`);
 
@@ -74,7 +81,8 @@ function createUploader(database, config, extractMetadata = extractPdfMetadata, 
     if (signature(await fs.stat(filePath)) !== expectedSignature) throw new Error('PDF changed while reading.');
     const hash = createHash('sha256').update(bytes).digest('hex');
     let record = find.get(filePath, hash);
-    if (record && !['failed', 'uncertain'].includes(record.status)) {
+    const pendingArchive = record && ['uploaded', 'duplicate'].includes(record.status) && !record.archived_at && !record.deleted_at;
+    if (record && !pendingArchive && !['failed', 'uncertain'].includes(record.status)) {
       if (!resetReturned.run(record.id).changes) return false;
       console.log(`PDF returned to folder: ${record.filename}; checking with the API again.`);
       record = find.get(filePath, hash);
@@ -148,11 +156,11 @@ function createUploader(database, config, extractMetadata = extractPdfMetadata, 
         console.log(`Retry scheduled in ${retryDelayMs / 1000} seconds for ${filename}.`);
         return false;
       }
-      // Persist confirmation before deleting so a restart never uploads it again.
+      // Persist confirmation before archiving; a failed move resumes without another POST.
       result.run(duplicateTitle ? 'duplicate' : 'uploaded', response.status, body, null,
         duplicateTitle ? null : new Date().toISOString(), record.id);
       record = find.get(filePath, hash);
-      console.log(duplicateTitle ? `Document title already exists: ${title}; deleting duplicate PDF.` : `API created request for: ${filename}`);
+      console.log(duplicateTitle ? `Document title already exists: ${title}; archiving duplicate PDF.` : `API created request for: ${filename}`);
       if (!duplicateTitle && config.desktopNotifications !== false) {
         try {
           notifyCreated(title, json.data?.reference);
@@ -171,14 +179,19 @@ function createUploader(database, config, extractMetadata = extractPdfMetadata, 
       if (currentHash !== hash || signature(await fs.stat(filePath)) !== expectedSignature) {
         throw new Error('PDF changed after upload; keeping current file.');
       }
-      await fs.unlink(filePath);
+      const metadata = JSON.parse(record.po_metadata || '{}');
+      const destination = await archivePdf({
+        source: filePath,
+        filename: metadata.filename || path.basename(filePath),
+        category: record.status === 'duplicate' ? 'already-exists' : 'created',
+        hash,
+        expectedSignature,
+        destination: record.archive_path,
+        remember: (archivePath) => rememberArchive.run(archivePath, record.id)
+      });
       cleanup.run(new Date().toISOString(), record.id);
-      console.log(`Deleted ${record.status === 'duplicate' ? 'duplicate' : 'uploaded'} PDF: ${filePath}`);
+      console.log(`Archived PDF: ${destination}`);
     } catch (error) {
-      if (error.code === 'ENOENT') {
-        cleanup.run(new Date().toISOString(), record.id);
-        return;
-      }
       cleanupError.run(error.message, record.id);
       throw error;
     }

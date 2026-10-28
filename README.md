@@ -61,7 +61,7 @@ The table stores `id`, `filename` (including `.pdf`), `file_path`, and
 `detected_at` (first detection time in UTC). The full path is unique, so restarting
 the listener or updating a PDF does not create duplicate rows. Files with the
 same name in different watched folders have separate rows. Records are retained
-when PDFs are deleted. PDF contents are not stored.
+when PDFs are archived or expire. PDF contents are not stored in SQLite.
 
 To view saved filenames using a SQLite database viewer, open `data/listener.db`
 and run:
@@ -97,7 +97,8 @@ Additional multipart fields for the backend to accept and store:
 The `attached_pdf` upload filename is `{po_no}-{vendor}.pdf`, with Windows-invalid
 characters replaced by underscores and trailing periods removed before `.pdf`.
 For this example it is `31164-Coca-Cola Europacific Philippines, Inc.pdf`.
-The original file on disk keeps its name until successful upload and deletion.
+The original file on disk keeps its name until the API confirms creation or an
+existing title, then moves to the archive using the parsed upload filename.
 No uniqueness hash is appended to the title; duplicate-title validation is the
 backend's responsibility.
 
@@ -110,14 +111,40 @@ try again. Local history never permanently blocks submission of a readable PDF;
 the backend is responsible for validation and duplicate-title detection.
 
 The `pdf_uploads` table records each path/content version, status, HTTP response,
-and upload/deletion timestamps. A confirmed successful JSON response is saved
-before the PDF is deleted. A changed file is retained. Cleanup failures retry
-without uploading again. If identical content returns to the same path after
-successful deletion, the listener submits it to the API again. A fresh explicit
-duplicate-title response allows deletion; if the request no longer exists, a
-successful creation allows deletion. Other failures retain the file. The latest
-attempt replaces the old local result for that path and content hash. The backend
-must enforce title uniqueness to prevent duplicate requests.
+upload time, `archive_path`, and `archived_at`. Existing databases are migrated
+automatically; `deleted_at` is retained for historical records from older versions.
+The confirmed API result is saved before moving the PDF. Changed files are
+retained. Archive failures resume without another POST, including after restart.
+If a previously archived PDF is copied back into the input folder, it is submitted
+again so the backend can validate its current state. The latest attempt replaces
+the old result for that path/content version. The backend must enforce title
+uniqueness to prevent duplicate requests.
+
+Processed PDFs move inside their own watched folder:
+
+```text
+elbert/
+  pending-file.pdf
+  2026-10-28/
+    created/
+      31164-Vendor.pdf
+    already-exists/
+      31165-Vendor.pdf
+```
+
+`created` holds successful requests; `already-exists` holds backend-confirmed
+duplicate titles. Date folders use the processing date in Asia/Manila, not the
+date printed on the PO. If the archive filename is occupied, a numeric suffix
+such as ` (1)` prevents overwriting. Archived folders are never scanned for upload.
+
+Retention runs at startup and hourly while the listener is running. It retains
+today and the previous six Manila calendar dates. For example, on October 28 it
+keeps October 22–28 and removes archived PDFs dated October 21 or earlier.
+After downtime, the next startup catches up. Only PDFs directly inside dated
+`created` and `already-exists` folders are removed; empty archive folders are then
+removed. Pending input PDFs, unrelated files/subfolders, symbolic links, and
+SQLite records are preserved. Archive date folders are dedicated to this
+listener; avoid storing unrelated PDFs inside their outcome folders.
 
 Rejected uploads (HTTP 4xx) are marked `failed` and automatically retried every
 `RETRY_DELAY_SECONDS` (default 30) until successful. The next retry time is saved
@@ -126,11 +153,11 @@ time are eligible immediately. Fix backend validation or permissions and the
 next attempt will use those changes; no database reset is needed.
 
 Exception: if the API explicitly reports that `document_title` already exists
-with HTTP 409 or 422, the listener records `duplicate` and deletes the unchanged
-PDF instead of retrying. It recognizes a duplicate message in
+with HTTP 409 or 422, the listener records `duplicate` and archives the unchanged
+PDF under `already-exists` instead of retrying. It recognizes a duplicate message in
 `errors.document_title`, a message naming the document title, or the code
 `document_title_exists` / `duplicate_document_title`. Other validation errors
-and generic conflicts do not trigger deletion. Duplicate cleanup uses the same
+and generic conflicts leave the PDF pending. Duplicate archiving uses the same
 file-change checks as successful uploads and does not show a request-created
 notification.
 
@@ -139,7 +166,7 @@ and retried after `RETRY_DELAY_SECONDS`. Existing local records, including
 interrupted uploads, do not block submission after restarting. SQLite records
 results and retry timing; the backend must enforce unique document titles,
 including retries after timeouts. If a prior attempt created the request, the
-backend's explicit duplicate-title response allows the local PDF to be deleted.
+backend's explicit duplicate-title response allows the local PDF to be archived.
 
 If the API rejects `template_id`, configure that template's approval path,
 signature placements, and active approvers in the backend first.
@@ -151,7 +178,7 @@ After the API confirms creation and SQLite saves the result, a desktop
 notification shows "E-sign request created", the document title, and the request
 reference when returned by the API. Cleanup retries and restarts do not repeat
 notifications for previously created requests. Notification failures are logged
-and do not interrupt PDF deletion or trigger another API call. Notifications
+and do not interrupt PDF archiving or trigger another API call. Notifications
 are best effort; a process crash between saving success and showing the toast
 can prevent one from appearing.
 

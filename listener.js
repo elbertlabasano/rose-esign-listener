@@ -6,6 +6,7 @@ const { mkdirSync } = require('node:fs');
 const { DatabaseSync } = require('node:sqlite');
 const { createUploader, signature: fileSignature } = require('./upload');
 const { readConfig } = require('./config');
+const { pruneArchives } = require('./archive');
 const config = readConfig();
 if (process.argv[2]) throw new Error('Configure watched folders and preparers in .env instead of command-line arguments.');
 
@@ -31,7 +32,8 @@ const watchers = config.folders.map((settings) => ({
   ...settings,
   uploadPdf: createUploader(database, settings),
   files: new Map(),
-  lastError: undefined
+  lastError: undefined,
+  nextCleanupAt: 0
 }));
 const pollMs = 1000;
 const stableMs = 2000;
@@ -46,6 +48,15 @@ async function onPdfReady(filePath, signature, uploadPdf) {
 
 async function scanFolder(watcher) {
   const { folder, files, uploadPdf } = watcher;
+  if (Date.now() >= watcher.nextCleanupAt) {
+    watcher.nextCleanupAt = Date.now() + 60 * 60 * 1000;
+    try {
+      const removed = await pruneArchives(folder);
+      if (removed) console.log(`Retention cleanup: removed ${removed} archived PDFs from ${folder}.`);
+    } catch (error) {
+      console.error(`Archive cleanup failed for ${folder}: ${error.message}`);
+    }
+  }
   try {
     const entries = await fs.readdir(folder, { withFileTypes: true });
     const seen = new Set();
