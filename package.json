@@ -1,0 +1,18 @@
+{
+  "name": "rose-esign-listener",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Watch a folder for PDF files",
+  "scripts": {
+    "start": "node listener.js",
+    "notify:test": "node notify-test.js",
+    "test": "node --test upload.test.js pdf-metadata.test.js config.test.js notifications.test.js"
+  },
+  "engines": {
+    "node": "^22.22.2 || ^24.15.0 || >=26.0.0"
+  },
+  "dependencies": {
+    "node-notifier": "^11.0.0",
+    "pdfjs-dist": "^6.4.299"
+  }
+}

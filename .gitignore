@@ -1,0 +1,7 @@
+/data/
+/node_modules/
+*.log
+/api.config.json
+.env
+.env.*
+!.env.example
