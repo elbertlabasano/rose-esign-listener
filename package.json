@@ -6,7 +6,8 @@
   "scripts": {
     "start": "node listener.js",
     "notify:test": "node notify-test.js",
-    "test": "node --test upload.test.js pdf-metadata.test.js config.test.js notifications.test.js archive.test.js"
+    "notify:agent": "node notification-agent.js",
+    "test": "node --test upload.test.js pdf-metadata.test.js config.test.js notifications.test.js notification-relay.test.js archive.test.js"
   },
   "engines": {
     "node": "^22.22.2 || ^24.15.0 || >=26.0.0"

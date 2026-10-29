@@ -183,9 +183,70 @@ are best effort; a process crash between saving success and showing the toast
 can prevent one from appearing.
 
 Set `DESKTOP_NOTIFICATIONS=false` in `.env` to disable them, then restart.
-Run the listener as the logged-in desktop user. Windows must allow notification
+For direct delivery, run the listener as the logged-in desktop user. Windows must allow notification
 banners and sounds; Do Not Disturb may suppress banners. The bundled notification
 helper may appear as "SnoreToast" in Windows notification settings.
+
+### Background processing with notifications for all Windows users
+
+Keep **one** `listener.js` process in the existing startup task under SYSTEM. It
+processes PDFs even when nobody is logged in. A separate `notification-agent.js`
+process runs in each desktop session and only displays notifications. It never
+loads `.env`/API credentials, watches folders, or uploads PDFs. Do not create a
+second `listener.js` task for each user, as that can process files twice.
+
+Delivery defaults to `auto`: SYSTEM on Windows writes notification events to
+`data/notifications/events.db`; ordinary desktop users keep direct notifications.
+For explicit service configuration, set `DESKTOP_NOTIFICATION_DELIVERY=relay` in
+the listener's `.env`. `direct` forces desktop display. `DESKTOP_NOTIFICATIONS=false`
+still disables new creation notifications entirely. The agent always displays
+directly, without loading the service configuration.
+
+After copying these updated files to `D:\rose-esign-listener`, run once from an
+**Administrator PowerShell** to install the helper's logon task:
+
+```powershell
+cd D:\rose-esign-listener
+powershell.exe -NoProfile -File .\install-notification-task.ps1
+```
+
+The task **Rose Esign Notifications** runs under the built-in Users group at user
+logon and uses a hidden-window launcher. It allows parallel instances for separate
+user sessions. SYSTEM continues running **Rose Esign Listener** at startup.
+Existing logged-in users can start `npm run notify:agent` from their own regular
+terminal immediately, or sign out and in after installation. A per-user/session
+lock prevents multiple notification helpers from showing the same event twice.
+Restart the SYSTEM listener after deploying. No new npm dependencies are required.
+
+The service account needs modify permission on `data/notifications`; users need
+only read/traverse access there. Only minimal event information (document title,
+reference, mode and time) is shared with local users. Do not grant users access to
+the service's `.env` or full `data/listener.db` just for notifications. Shared event
+files must not be writable by ordinary users; user cursors live separately under
+`%LOCALAPPDATA%\RoseEsignListener`. Review inherited folder permissions accordingly.
+
+New helpers start at the current queue position and show future events only.
+Existing helpers retain independent per-session cursors, catch up on events from
+the last 10 minutes, and skip older events. Seven days of events are retained and
+pruned on new publications. Progress is saved before asking Windows to show a
+toast, so a crash in that narrow interval can lose a banner; visible delivery is
+still best effort. Events are broadcast to every running local user-session helper.
+
+To test without creating a request or touching PDFs:
+
+1. In a logged-in user's terminal, run `npm run notify:agent` and leave it open.
+2. In another terminal, publish a local relay test:
+
+```powershell
+node -e "require('./notification-relay').publishNotification('Notification relay test', 'TEST-ONLY')"
+```
+
+The relay test command needs write access to the shared events folder; use an
+administrator terminal if ordinary users have read-only access. Test every logged-in
+user session, then test a real PDF through the one SYSTEM listener. Windows Do Not
+Disturb and per-user notification settings still apply. The automated tests exercise
+the queue/cursors with temporary SQLite databases and mocked notifications; they
+do not prove a visible Windows banner or task installation on the target PC.
 
 Test notifications without uploading a PDF:
 

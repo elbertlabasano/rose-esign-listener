@@ -1,12 +1,28 @@
 'use strict';
 
+function notificationDelivery(options = {}, env = process.env, platform = process.platform) {
+  const delivery = options.delivery || env.DESKTOP_NOTIFICATION_DELIVERY || 'auto';
+  if (!['auto', 'direct', 'relay'].includes(delivery)) {
+    throw new Error('DESKTOP_NOTIFICATION_DELIVERY must be auto, direct or relay.');
+  }
+  if (options.test) return 'direct';
+  if (delivery !== 'auto') return delivery;
+  return platform === 'win32' && /^SYSTEM$/i.test(env.USERNAME || '') ? 'relay' : 'direct';
+}
+
 function notifyRequestCreated(documentTitle, reference, send, options = {}) {
   // Do not wait for a user to dismiss a toast before processing the next PDF.
   try {
-    const module = send ? null : require('node-notifier');
-    const backend = module?.default || module;
     const mode = options.mode || process.env.DESKTOP_NOTIFICATION_MODE || 'toast';
     if (!['toast', 'balloon'].includes(mode)) throw new Error('DESKTOP_NOTIFICATION_MODE must be toast or balloon.');
+    if (!send && notificationDelivery(options) === 'relay') {
+      const publish = options.publish || require('./notification-relay').publishNotification;
+      publish(documentTitle, reference, { mode });
+      console.log('Desktop notification queued for user-session helpers: ' + documentTitle);
+      return;
+    }
+    const module = send ? null : require('node-notifier');
+    const backend = module?.default || module;
     const selected = !send && mode === 'balloon' && process.platform === 'win32'
       ? new backend.WindowsBalloon({ withFallback: false }) : backend;
     const notifier = send || selected.notify.bind(selected);
@@ -29,4 +45,4 @@ function notifyRequestCreated(documentTitle, reference, send, options = {}) {
   }
 }
 
-module.exports = { notifyRequestCreated };
+module.exports = { notifyRequestCreated, notificationDelivery };
